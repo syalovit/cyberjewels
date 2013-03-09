@@ -1,0 +1,100 @@
+dim connected
+dim hrm(2)
+
+# System start/boot listener
+event system_boot(major,minor,patch,build,ll_version,protocol,hw) 
+    # Device is not connected yet
+	connected = 0
+
+	# Set advertisement interval to 20 to 30ms. Use all advertisement channels
+	call gap_set_adv_parameters(32,48,7)
+	
+	# Start advertisement (generic discoverable, undirected connectable)
+	call gap_set_mode(2,2)
+
+	# Start single shot timer with 30 second interval. Handle ID 1
+	# 1 second = $8000 (32.768kHz crystal)
+	call hardware_set_soft_timer($F0000, 1, 1)
+	# set the P1 bank as output
+    call hardware_io_port_config_direction(1, 1)    
+	# set the P0 bank as input
+	call hardware_io_port_config_direction(0, 0)
+    # set the P1 bank for P1_0 as on for sensor
+    call hardware_io_port_write(1, 0, 1)			
+end
+
+# Timer event(s) listener
+event hardware_soft_timer(handle)
+    # 30 second timer expired 
+	if handle = 1 then
+		# No connection
+		if connected = 0 then
+			# Stop advertisement
+			call gap_set_mode(0, 0)
+
+			# Reconfigure advertisement parameters
+			# Min interval 1000ms, max interval 2500ms, use all 3 channels
+			call gap_set_adv_parameters(1600, 4000, 7)
+
+			# Enabled advertisement
+			# Limited discovery, Undirected connectable
+			call gap_set_mode(1, 2)
+			
+			# Start single shot timer with 30 second interval. Handle ID 2
+			# This is used to stop advertisemnts after 60 seconds to save power
+			call hardware_set_soft_timer($F0000, 2, 1)
+		end if
+	end if
+	
+	# 60 second timer expired 
+	if handle = 2 then
+		# No connection
+		if connected = 0 then
+			# Stop advertisement. Device will enter Power Mode 3 to save battery
+			call gap_set_mode(0, 0)
+		end if
+	end if
+	
+	# HR timer expired
+	if handle = 3 then
+		#read the P0_1 sensor
+        call hardware_adc_read(1,1,2)
+	end if
+end
+
+#ADC event listener for HR measurement
+event hardware_adc_result(input,value)
+	#potentiometer value is measured
+	if input = 1 then	
+			# Heart Rate Measurement flags field (8 bits)
+			# RR not present, EE not present, SC feature supported, but no contact detected, HR format is UINT8
+			hrm(0:1)=2
+			#calculate some valid hr value 20-224
+			hrm(1:1)=value/160+20
+			# Write value to GATT database
+			call attributes_write(xgatt_HRS_2a37,0,2,hrm(0:2))
+	end if
+end
+
+# Connection event listener
+event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency,bonding)
+	# End advertisement timers, so HR timer can be started
+	call hardware_set_soft_timer(0, 2, 1)
+	call hardware_set_soft_timer(0, 1, 1)
+	# Device is connected. 
+	# Set <connected> to true, or otherwise the advertisemnt timers will disconnect the device
+	connected = 1	
+	# Start HR monitoring timer: 1 second interval, ID 3, continuous timer
+	call hardware_set_soft_timer($8000, 3, 0)
+end
+
+# Disconnection event listener
+event connection_disconnected(handle, result)
+	# End HR timer, so advertisement timer can be restarted
+	call hardware_set_soft_timer(0, 3, 0)
+	# Connection disconnected, reinitiate connection procedure
+	connected = 0
+	call gap_set_adv_parameters(32,48,7)
+	call gap_set_mode(2,2)
+	call hardware_set_soft_timer($F0000, 1, 1)
+end
