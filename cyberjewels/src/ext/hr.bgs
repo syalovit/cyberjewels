@@ -1,11 +1,48 @@
 dim connected
 dim hrm(2)
+dim Signal
+dim runningTotal
+dim Pulse
+dim rate(40)                    # used to hold last ten IBI values 10 bytes each, raw ADC based on 10 MSB 
+dim sampleCounter          # used to determine pulse timing
+dim N
+dim lastBeatTime           # used to find the inter beat interval
+dim P                  # used to find peak in pulse wave
+dim T                     # used to find trough in pulse wave
+dim thresh                # used to find instant moment of heart beat
+dim amp                   # used to hold amplitude of pulse waveform
+dim firstBeat        # used to seed rate array so we startup with reasonable BPM
+dim secondBeat       # used to seed rate array so we startup with reasonable BPM
+dim i
+dim IBI
+dim BPM
+dim string(3)
 
 # System start/boot listener
 event system_boot(major,minor,patch,build,ll_version,protocol,hw) 
     # Device is not connected yet
 	connected = 0
+	runningTotal = 0
+	N = 0
+	Pulse = 0
+	sampleCounter = 0
+	lastBeatTime = 0
+	P =256
+	T = 256
+	thresh = 256
+	amp = 100
+	firstBeat = 1
+	secondBeat = 1
 
+	call hardware_io_port_write(1,$3,$1)
+	call hardware_io_port_config_direction(1,$7)
+	# Initialize the display (see NHDC0216CZFSWFBW3V3 data sheet)
+	call hardware_spi_transfer(0,11,"\x30\x30\x30\x39\x14\x56\x6d\x70\x0c\x06\x01")
+	# Set display to data mode
+	# Write "Hello world\!" to the display.
+	call hardware_io_port_write(1,$3,$3)
+	call hardware_spi_transfer(0,12,"Hello world\!")	
+	
 	# Set advertisement interval to 20 to 30ms. Use all advertisement channels
 	call gap_set_adv_parameters(32,48,7)
 	
@@ -16,8 +53,9 @@ event system_boot(major,minor,patch,build,ll_version,protocol,hw)
 	# 1 second = $8000 (32.768kHz crystal)
 	call hardware_set_soft_timer($F0000, 1, 1)
 	# set the P0 bank as input
+	hrm(0:2) = 0		
 	call hardware_io_port_config_direction(0, 0)
-    	
+
 end
 
 # Timer event(s) listener
@@ -56,7 +94,7 @@ event hardware_soft_timer(handle)
 	if handle = 3 then
 		#read the P0_1 sensor
 		#read  10 MSB, in synch with arduino ADC
-        call hardware_adc_read(1,2,2)
+        call hardware_adc_read(1,3,2)
 	end if
 end
 
@@ -66,17 +104,97 @@ event hardware_adc_result(input,value)
 	if input = 1 then	
 			# Heart Rate Measurement flags field (8 bits)
 			# RR not present, EE not present, SC feature supported, but no contact detected, HR format is UINT8
-			#hrm(0:1)=2
-			
+			#hrm(0:1)=2			
 			#hrm(1:1)=value>>12
-			# shifted by 16bits-10bits, or 2^6
-			hrm(0:2)=value/64
+			# shifted by 16bits-12bits, or 2^6
+			#hrm(0:2)=value/16
 			# Write value to GATT database
 			# turn off P1 bank
 			# call hardware_io_port_config_direction(1, 0)   		
 			# set the P1 bank for P1_0 as off for sensor
-			# call hardware_io_port_write(1, 0, 0)		
+			# call hardware_io_port_write(1, 0, 0)
 			
+#######################
+
+ 
+    		Signal = value/16    		
+			string(0:1) = (Signal / 100) + 48
+			string(1:1) = (Signal / 10) + (Signal / -100 * 10) + 48
+			string(2:1) = Signal + (Signal / 10 * -10) + 48
+			call hardware_spi_transfer(0,3,string(0:3))
+    		sampleCounter = sampleCounter + 2                         # keep track of the time in mS with this variable
+    		N = sampleCounter - lastBeatTime       # monitor the time since the last beat to avoid noise
+
+			#  find the peak and trough of the pulse wave
+		    if (Signal < thresh) && (N > (IBI/5)*3) then       # avoid dichrotic noise by waiting 3/5 of last IBI
+		    	if (Signal < T)  then                      # T is the trough
+		            T = Signal                         # keep track of lowest point in pulse wave
+		        end if
+		    end if 
+		         
+		       		      
+		    if(Signal > thresh && Signal > P) then         # thresh condition helps avoid noise
+		        P = Signal                             # P is the peak
+		    end if                                        # keep track of highest point in pulse wave
+		    
+		  #  NOW IT'S TIME TO LOOK FOR THE HEART BEAT
+		  # signal surges up in value every time there is a pulse
+			if (N > 250) then                                  # avoid high frequency noise
+				if  ((Signal > thresh) && (Pulse = 0) && (N > (IBI/5)*3)) then        
+			    	Pulse = 1                                  # set the Pulse flag when we think there is a pulse
+			    	IBI = sampleCounter - lastBeatTime         # measure time between beats in mS
+			    	lastBeatTime = sampleCounter               # keep track of time for next pulse
+			         
+			        if (firstBeat = 1)                          # if it's the first time we found a beat, if firstBeat == TRUE			        	 
+			             firstBeat = 0                 # clear firstBeat flag
+			             return                             # IBI value is unreliable so discard it
+			          end if   
+			         if(secondBeat = 1)                         # if this is the second beat, if secondBeat == TRUE
+			            secondBeat = 0                 			# clear secondBeat flag
+			            hrm(0:2) = 1
+			            i = 0
+			            while (i<=9)
+			            	rate(i*4:4) = IBI					#  seed the running total to get a realisitic BPM at startup
+			            	i = i + 1
+			             end while
+			          end if
+			        
+				    # keep a running total of the last 10 IBI values
+				    runningTotal = 0                   # clear the runningTotal variable    
+					i = 0
+					while (i<=8)						# shift data in the rate array
+				          rate(i:4) = rate(i+1:4)              # and drop the oldest IBI value 
+				          runningTotal = runningTotal + rate(i)          # add up the 9 oldest IBI values
+				          i = i + 1				
+					end while
+					
+				    rate(9) = IBI                          # add the latest IBI to the rate array
+				    runningTotal = runningTotal + rate(9)                # add the latest IBI to runningTotal
+				    runningTotal = runningTotal / 10                     # average the last 10 IBI values 
+				    BPM = 60000/runningTotal               # how many beats can fit into a minute? that's BPM!			     
+				    hrm(0:2) = BPM
+				    # QS FLAG IS NOT CLEARED INSIDE THIS ISR
+			    end if                      
+			end if
+		
+		  if (Signal < thresh) && (Pulse = 1) then    # when the values are going down, the beat is over
+		      Pulse = 0                         # reset the Pulse flag so we can do it again
+		      amp = P - T                           # get amplitude of the pulse wave
+		      thresh = amp/2 + T                    # set thresh at 50% of the amplitude
+		      P = thresh                            # reset these for next time
+		      T = thresh
+		  end if
+		  
+		  if (N > 2500) then                             # if 2.5 seconds go by without a beat
+		      thresh = 256                          # set thresh default
+		      P = 256                               # set P default
+		      T = 256                               # set T default
+		      lastBeatTime = sampleCounter          # bring the lastBeatTime up to date        
+		      firstBeat = 1                      # set these to avoid noise
+		      secondBeat = 1                     # when we get the heartbeat back
+		  end if
+		  
+#######################			
 			call attributes_write(xgatt_HRS_2a37,0,2,hrm(0:2))
 	end if
 end
